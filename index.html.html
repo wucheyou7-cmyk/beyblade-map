@@ -1,0 +1,287 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>陀螺配對 - Firebase 即時連線版</title>
+  <!-- Leaflet 地圖樣式 -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; font-family: sans-serif; }
+    body { display: flex; flex-direction: column; height: 100vh; background: #121212; color: #fff; }
+    
+    header { padding: 12px; background: #1f1f1f; display: flex; gap: 8px; align-items: center; justify-content: space-between; border-bottom: 1px solid #333; flex-wrap: wrap; }
+    .status-panel { display: flex; align-items: center; gap: 10px; }
+    .btn { padding: 8px 12px; border: none; border-radius: 6px; font-weight: bold; cursor: pointer; transition: 0.2s; }
+    .btn-green { background: #2e7d32; color: #fff; }
+    .btn-red { background: #c62828; color: #fff; }
+    .btn-team { background: #1565c0; color: #fff; }
+    .btn-broadcast { background: #ff8f00; color: #fff; }
+    
+    /* 地圖容器與定位按鈕定位 */
+    .map-container { position: relative; flex: 1; width: 100%; }
+    #map { width: 100%; height: 100%; z-index: 1; }
+    
+    /* 右下角浮動即時定位按鈕 */
+    .btn-locate {
+      position: absolute;
+      bottom: 24px;
+      right: 24px;
+      z-index: 999;
+      width: 50px;
+      height: 50px;
+      border-radius: 50%;
+      background: #1f1f1f;
+      color: #fff;
+      border: 2px solid #444;
+      font-size: 22px;
+      box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: transform 0.2s, background 0.2s;
+    }
+    .btn-locate:active {
+      transform: scale(0.9);
+      background: #333;
+    }
+
+    .custom-marker { display: flex; align-items: center; justify-content: center; border-radius: 50%; font-size: 18px; border: 3px solid #fff; box-shadow: 0 0 8px rgba(0,0,0,0.5); }
+    .marker-ready { background: #4caf50; border-color: #a5d6a7; }
+    .marker-team { background: #2196f3; border-color: #90caf9; }
+    
+    .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.8); z-index: 1000; justify-content: center; align-items: center; }
+    .modal-content { background: #242424; padding: 20px; border-radius: 12px; width: 90%; max-width: 400px; border: 1px solid #444; }
+    .modal-content input { width: 100%; padding: 8px; margin: 8px 0; background: #333; border: 1px solid #555; color: #fff; border-radius: 4px; }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="status-panel">
+      <button id="toggleStatusBtn" class="btn btn-red" onclick="toggleStatus()">🔴 狀態：隱蔽中</button>
+      <label><input type="checkbox" id="hasStadium" onchange="updatePlayerState()"> 🏟️ 有盤</label>
+    </div>
+    <div>
+      <button class="btn btn-team" onclick="openTeamModal()">🛡️ 戰隊系統</button>
+      <button class="btn btn-broadcast" onclick="sendTeamBroadcast()">📢 隊伍召集</button>
+    </div>
+  </header>
+
+  <!-- 地圖容器區塊 -->
+  <div class="map-container">
+    <div id="map"></div>
+    <!-- 🎯 即時定位按鈕 -->
+    <button class="btn-locate" onclick="centerToMyLocation()" title="回到我的位置">🎯</button>
+  </div>
+
+  <!-- 戰隊彈窗 -->
+  <div id="teamModal" class="modal">
+    <div class="modal-content">
+      <h3>🛡️ 戰隊管理</h3>
+      <input type="text" id="playerNameInput" placeholder="輸入你的玩家暱稱...">
+      <input type="text" id="teamNameInput" placeholder="輸入戰隊名稱...">
+      <div style="display: flex; gap: 8px; margin-top: 12px;">
+        <button class="btn btn-green" style="flex:1" onclick="joinOrCreateTeam()">設定/更新</button>
+        <button class="btn btn-red" style="flex:1" onclick="closeTeamModal()">關閉</button>
+      </div>
+      <hr style="margin: 15px 0; border-color: #444;">
+      <div id="teamInfo">當前未設定戰隊資訊</div>
+    </div>
+  </div>
+
+  <!-- 引入 Firebase SDK (ES Module) -->
+  <script type="module">
+    import { initializeApp } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-app.js";
+    import { 
+      getDatabase, ref, set, remove, onValue, onDisconnect 
+    } from "https://www.gstatic.com/firebasejs/10.8.0/firebase-database.js";
+
+    // ⚠️ 請替換為你的 Firebase 專案設定檔
+    const firebaseConfig = {
+      apiKey: "YOUR_API_KEY",
+      authDomain: "YOUR_PROJECT.firebaseapp.com",
+      databaseURL: "https://YOUR_PROJECT-default-rtdb.firebaseio.com",
+      projectId: "YOUR_PROJECT",
+      storageBucket: "YOUR_PROJECT.appspot.com",
+      messagingSenderId: "YOUR_SENDER_ID",
+      appId: "YOUR_APP_ID"
+    };
+
+    const app = initializeApp(firebaseConfig);
+    const db = getDatabase(app);
+
+    let myUid = localStorage.getItem('beyblade_uid');
+    if (!myUid) {
+      myUid = 'user_' + Math.random().toString(36).substring(2, 9);
+      localStorage.setItem('beyblade_uid', myUid);
+    }
+
+    window.playerState = {
+      uid: myUid,
+      name: localStorage.getItem('beyblade_name') || "陀螺手_" + myUid.substring(5, 8),
+      isGreen: false,
+      hasStadium: false,
+      team: localStorage.getItem('beyblade_team') || "",
+      lat: 25.0330,
+      lng: 121.5654
+    };
+
+    let map;
+    const remoteMarkers = {};
+
+    function initMap() {
+      map = L.map('map').setView([window.playerState.lat, window.playerState.lng], 15);
+      L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        maxZoom: 19,
+        attribution: '© OpenStreetMap'
+      }).addTo(map);
+
+      // 持續監聽 GPS 位置
+      if (navigator.geolocation) {
+        navigator.geolocation.watchPosition(pos => {
+          window.playerState.lat = pos.coords.latitude;
+          window.playerState.lng = pos.coords.longitude;
+          
+          if (window.playerState.isGreen) {
+            syncToFirebase();
+          }
+        }, err => console.log(err), { enableHighAccuracy: true });
+      }
+
+      listenToFirebase();
+    }
+
+    // 🎯 點擊回到我的當前位置
+    window.centerToMyLocation = function() {
+      if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(pos => {
+          window.playerState.lat = pos.coords.latitude;
+          window.playerState.lng = pos.coords.longitude;
+          
+          // 平滑移動視角並對焦到最新座標
+          map.panTo([window.playerState.lat, window.playerState.lng], { animate: true, duration: 0.8 });
+          map.setZoom(16);
+
+          if (!window.playerState.isGreen) {
+            console.log("目前為紅燈隱蔽模式，地圖僅移動至個人定位點。");
+          }
+        }, () => {
+          alert("無法獲取你的 GPS 位置，請確認已開啟定位權限！");
+        });
+      }
+    };
+
+    function syncToFirebase() {
+      const userRef = ref(db, 'players/' + window.playerState.uid);
+      onDisconnect(userRef).remove();
+
+      set(userRef, {
+        name: window.playerState.name,
+        hasStadium: window.playerState.hasStadium,
+        team: window.playerState.team,
+        lat: window.playerState.lat,
+        lng: window.playerState.lng,
+        updatedAt: Date.now()
+      });
+    }
+
+    function removeFromFirebase() {
+      const userRef = ref(db, 'players/' + window.playerState.uid);
+      remove(userRef);
+    }
+
+    function listenToFirebase() {
+      const playersRef = ref(db, 'players');
+
+      onValue(playersRef, (snapshot) => {
+        const data = snapshot.val() || {};
+        
+        Object.keys(remoteMarkers).forEach(uid => {
+          if (!data[uid]) {
+            map.removeLayer(remoteMarkers[uid]);
+            delete remoteMarkers[uid];
+          }
+        });
+
+        Object.keys(data).forEach(uid => {
+          const p = data[uid];
+          const isMe = (uid === window.playerState.uid);
+          
+          const stadiumIcon = p.hasStadium ? "🏟️" : "⚔️";
+          const isSameTeam = p.team && (p.team === window.playerState.team);
+          const markerClass = isSameTeam ? "marker-team" : "marker-ready";
+          
+          const iconHtml = `<div class="custom-marker ${markerClass}">${stadiumIcon}</div>`;
+          const customIcon = L.divIcon({ html: iconHtml, className: '', iconSize: [36, 36] });
+
+          if (remoteMarkers[uid]) {
+            remoteMarkers[uid].setLatLng([p.lat, p.lng]);
+            remoteMarkers[uid].setIcon(customIcon);
+          } else {
+            remoteMarkers[uid] = L.marker([p.lat, p.lng], { icon: customIcon }).addTo(map);
+          }
+
+          const meTag = isMe ? " (你)" : "";
+          const teamTag = p.team ? `<br>🛡️ 戰隊：${p.team}` : "";
+          const actionBtn = isMe ? "" : `<br><button onclick="alert('對【${p.name}】發送決鬥邀請！')">發送邀請</button>`;
+
+          remoteMarkers[uid].bindPopup(
+            `<b>${p.name}${meTag}</b>${teamTag}<br>戰鬥盤：${p.hasStadium ? '有帶盤' : '無戰鬥盤'}${actionBtn}`
+          );
+        });
+      });
+    }
+
+    window.toggleStatus = function() {
+      window.playerState.isGreen = !window.playerState.isGreen;
+      const btn = document.getElementById('toggleStatusBtn');
+
+      if (window.playerState.isGreen) {
+        btn.className = "btn btn-green";
+        btn.innerText = "🟢 狀態：可戰中";
+        syncToFirebase();
+      } else {
+        btn.className = "btn btn-red";
+        btn.innerText = "🔴 狀態：隱蔽中";
+        removeFromFirebase();
+      }
+    };
+
+    window.updatePlayerState = function() {
+      window.playerState.hasStadium = document.getElementById('hasStadium').checked;
+      if (window.playerState.isGreen) syncToFirebase();
+    };
+
+    window.joinOrCreateTeam = function() {
+      const name = document.getElementById('playerNameInput').value.trim();
+      const team = document.getElementById('teamNameInput').value.trim();
+
+      if (name) {
+        window.playerState.name = name;
+        localStorage.setItem('beyblade_name', name);
+      }
+      if (team) {
+        window.playerState.team = team;
+        localStorage.setItem('beyblade_team', team);
+      }
+
+      document.getElementById('teamInfo').innerHTML = `<b>暱稱：</b>${window.playerState.name}<br><b>當前戰隊：</b>${window.playerState.team || '無'}`;
+      alert("設定儲存完成！");
+      window.closeTeamModal();
+      if (window.playerState.isGreen) syncToFirebase();
+    };
+
+    window.openTeamModal = function() { 
+      document.getElementById('playerNameInput').value = window.playerState.name;
+      document.getElementById('teamNameInput').value = window.playerState.team;
+      document.getElementById('teamModal').style.display = 'flex'; 
+    };
+    window.closeTeamModal = function() { document.getElementById('teamModal').style.display = 'none'; };
+
+    window.onload = initMap;
+  </script>
+</body>
+</html>
